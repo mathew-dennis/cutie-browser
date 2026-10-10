@@ -20,6 +20,39 @@ CutieWindow {
     property string activeName: ""
     property real activeProgress: 0
 
+    function fileUrl(path) {
+        // encodeURI leaves '#' and '?' alone, which breaks file names containing them
+        return "file://" + path.split("/").map(encodeURIComponent).join("/");
+    }
+
+    function statusText(status) {
+        return status === "completed" ? qsTr("Completed")
+             : status === "downloading" ? qsTr("Downloading…")
+             : status === "cancelled" ? qsTr("Cancelled")
+             : qsTr("Failed");
+    }
+
+    function indexOfDownload(did) {
+        for (var i = 0; i < downloadsModel.count; i++)
+            if (downloadsModel.get(i).did === did) return i;
+        return -1;
+    }
+
+    // derive the top bar state from the model so concurrent downloads can't desync it
+    function updateActive() {
+        var n = 0, sum = 0, name = "";
+        for (var i = 0; i < downloadsModel.count; i++) {
+            var d = downloadsModel.get(i);
+            if (d.status !== "downloading") continue;
+            if (n === 0) name = d.name;
+            sum += d.progress;
+            n++;
+        }
+        activeDownloads = n;
+        activeName = name;
+        activeProgress = n > 0 ? sum / n : 0;
+    }
+
     function db() {
         return LocalStorage.openDatabaseSync("CutieBrowser", "1.0", "Cutie Browser data", 1000000);
     }
@@ -32,40 +65,37 @@ CutieWindow {
             var rs = tx.executeSql("SELECT * FROM downloads ORDER BY ts DESC");
             for (var i = 0; i < rs.rows.length; i++) {
                 var r = rs.rows.item(i);
-                downloadsModel.append({did: r.did, name: r.name, path: r.path, status: r.status});
+                downloadsModel.append({did: r.did, name: r.name, path: r.path, status: r.status, progress: 0});
             }
         });
     }
 
     function setDownloadStatus(did, status) {
-        for (var i = 0; i < downloadsModel.count; i++) {
-            if (downloadsModel.get(i).did === did) {
-                if (downloadsModel.get(i).status !== "downloading") return;
-                downloadsModel.setProperty(i, "status", status);
-                activeDownloads = Math.max(0, activeDownloads - 1);
-                db().transaction(function(tx) {
-                    tx.executeSql("UPDATE downloads SET status=? WHERE did=?", [status, did]);
-                });
-                return;
-            }
-        }
+        var i = indexOfDownload(did);
+        if (i < 0 || downloadsModel.get(i).status !== "downloading") return;
+        downloadsModel.setProperty(i, "status", status);
+        if (status === "completed") downloadsModel.setProperty(i, "progress", 1);
+        updateActive();
+        db().transaction(function(tx) {
+            tx.executeSql("UPDATE downloads SET status=? WHERE did=?", [status, did]);
+        });
     }
 
     function trackDownload(download) {
         var did = Date.now() + "-" + download.id;
         var name = download.downloadFileName;
         var path = download.downloadDirectory + "/" + name;
-        downloadsModel.insert(0, {did: did, name: name, path: path, status: "downloading"});
+        downloadsModel.insert(0, {did: did, name: name, path: path, status: "downloading", progress: 0});
         db().transaction(function(tx) {
             tx.executeSql("INSERT OR REPLACE INTO downloads VALUES(?,?,?,?,?)", [did, name, path, "downloading", Date.now()]);
         });
-        activeDownloads++;
-        activeName = name;
-        activeProgress = 0;
+        updateActive();
 
         download.receivedBytesChanged.connect(function() {
-            activeName = name;
-            activeProgress = download.totalBytes > 0 ? download.receivedBytes / download.totalBytes : 0;
+            var i = indexOfDownload(did);
+            if (i < 0) return;
+            downloadsModel.setProperty(i, "progress", download.totalBytes > 0 ? download.receivedBytes / download.totalBytes : 0);
+            updateActive();
         });
         download.stateChanged.connect(function() {
             if (download.state === WebEngineDownloadRequest.DownloadCompleted)
@@ -165,15 +195,14 @@ CutieWindow {
                 icon.color: Atmosphere.textColor
 
                 onClicked: moreMenu.open()
+            }
 
-                Menu {
-                    id: moreMenu
-                    x: menuButton.width - width
-                    y: -implicitHeight
-                    MenuItem {
-                        text: qsTr("Downloads")
-                        onTriggered: downloadsPanel.visible = true
-                    }
+            CutieMenu {
+                id: moreMenu
+                y: -height - 10
+                CutieMenuItem {
+                    text: qsTr("Downloads")
+                    onTriggered: downloadsPanel.visible = true
                 }
             }
 
@@ -221,31 +250,35 @@ CutieWindow {
         }
         ListModel { id: downloadsModel }
 
-        Rectangle {
+        CutieTile {
             id: downloadBar
             z: 10
             anchors.top: parent.top
             anchors.left: parent.left
             anchors.right: parent.right
-            height: 36
-            color: "#E6141414"
-            visible: activeDownloads > 0
+            anchors.margins: 10
+            height: 40
+            visible: activeDownloads > 0 && !downloadsPanel.visible
 
-            Label {
+            CutieLabel {
                 anchors.fill: parent
                 anchors.leftMargin: 12
                 anchors.rightMargin: 12
                 verticalAlignment: Text.AlignVCenter
                 elide: Text.ElideMiddle
-                color: "white"
-                text: qsTr("Downloading ") + activeName
+                text: activeDownloads > 1
+                      ? qsTr("Downloading %1 files").arg(activeDownloads)
+                      : qsTr("Downloading ") + activeName
             }
             Rectangle {
                 anchors.bottom: parent.bottom
+                anchors.bottomMargin: 4
                 anchors.left: parent.left
+                anchors.leftMargin: 8
                 height: 3
-                width: parent.width * activeProgress
-                color: "white"
+                radius: 2
+                width: (parent.width - 16) * activeProgress
+                color: Atmosphere.accentColor
             }
             MouseArea {
                 anchors.fill: parent
@@ -253,7 +286,7 @@ CutieWindow {
             }
         }
 
-        Rectangle {
+        Item {
             id: downloadsPanel
             z: 20
             visible: false
@@ -261,80 +294,78 @@ CutieWindow {
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.bottom: headerBar.top
-            color: "#F2141414"
 
             MouseArea { anchors.fill: parent } // block clicks to the page below
 
-            Row {
+            FastBlur {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                height: webview.height
+                source: webview
+                radius: 70
+            }
+
+            Rectangle {
+                anchors.fill: parent
+                color: Atmosphere.primaryColor
+                opacity: 0.6
+            }
+
+            CutiePageHeader {
                 id: downloadsHeader
                 anchors.top: parent.top
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.margins: 8
-                height: 44
-                spacing: 8
-                Label {
-                    width: parent.width - clearButton.width - closeButton.width - 2 * parent.spacing
-                    height: parent.height
-                    verticalAlignment: Text.AlignVCenter
-                    color: "white"
-                    font.bold: true
-                    text: qsTr("Downloads")
-                }
-                CutieButton {
-                    id: clearButton
-                    text: qsTr("Clear")
-                    onClicked: clearDownloads()
-                }
-                CutieButton {
-                    id: closeButton
-                    text: qsTr("Close")
-                    onClicked: downloadsPanel.visible = false
-                }
+                title: qsTr("Downloads")
             }
 
-            ListView {
+            CutieListView {
                 anchors.top: downloadsHeader.bottom
                 anchors.bottom: parent.bottom
                 anchors.left: parent.left
                 anchors.right: parent.right
-                anchors.margins: 8
                 clip: true
                 model: downloadsModel
-                delegate: Item {
-                    width: ListView.view.width
-                    height: 56
-                    Column {
-                        anchors.fill: parent
-                        anchors.verticalCenter: parent.verticalCenter
-                        Label {
-                            width: parent.width
-                            elide: Text.ElideMiddle
-                            color: "white"
-                            text: model.name
-                        }
-                        Label {
-                            width: parent.width
-                            elide: Text.ElideMiddle
-                            color: "#AAAAAA"
-                            font.pixelSize: 12
-                            text: (model.status === "completed" ? qsTr("Completed")
-                                  : model.status === "downloading" ? qsTr("Downloading…")
-                                  : model.status === "cancelled" ? qsTr("Cancelled")
-                                  : qsTr("Failed")) + " — " + model.path
-                        }
+
+                menu: CutieMenu {
+                    CutieMenuItem {
+                        text: qsTr("Clear finished")
+                        onTriggered: clearDownloads()
                     }
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: model.status === "completed"
-                        onClicked: Qt.openUrlExternally(encodeURI("file://" + model.path))
+                    CutieMenuItem {
+                        text: qsTr("Close")
+                        onTriggered: downloadsPanel.visible = false
+                    }
+                }
+
+                delegate: CutieListItem {
+                    text: model.name
+                    subText: statusText(model.status) + " — " + model.path
+                    wrapMode: Text.NoWrap
+                    elide: Text.ElideMiddle
+                    onClicked: {
+                        if (model.status === "completed")
+                            Qt.openUrlExternally(fileUrl(model.path))
+                    }
+
+                    Rectangle {
+                        visible: model.status === "downloading"
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: 6
+                        anchors.left: parent.left
+                        anchors.leftMargin: 36
+                        height: 3
+                        radius: 2
+                        width: (parent.width - 72) * model.progress
+                        color: Atmosphere.accentColor
                     }
                 }
             }
-            Label {
+
+            CutieLabel {
                 anchors.centerIn: parent
                 visible: downloadsModel.count === 0
-                color: "#AAAAAA"
                 text: qsTr("No downloads")
             }
         }
